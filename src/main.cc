@@ -423,6 +423,22 @@ std::unique_ptr<UserInterface> create_local_ui(UIType ui_type)
     return make_unique<LocalUI>();
 }
 
+void sigint_handler(int signal){
+    Key key = ctrl(Key('c'));
+    Vector<std::unique_ptr<Client>, MemoryDomain::Client>::const_iterator it =
+            ClientManager::instance().begin();
+    const bool debug_keys = (bool)((*it)->context().options()["debug"].get<DebugFlags>() & DebugFlags::Keys);
+
+    /* Copied from
+     * bool Client::process_pending_inputs()
+     * in client.cc */
+    if (debug_keys)
+        write_to_debug_buffer(format("Client '{}' got key '{}'",
+                                     (*it)->context().name(), key_to_str(key)));
+    (*it)->input_handler().handle_key(key);
+    (*it)->context().hooks().run_hook("RawKey", key_to_str(key), (*it)->context());
+}
+
 void signal_handler(int signal)
 {
     NCursesUI::abort();
@@ -729,7 +745,7 @@ int main(int argc, char* argv[])
     set_signal_handler(SIGQUIT, signal_handler);
     set_signal_handler(SIGTERM, signal_handler);
     set_signal_handler(SIGPIPE, SIG_IGN);
-    set_signal_handler(SIGINT, [](int){});
+    set_signal_handler(SIGINT, sigint_handler);
     set_signal_handler(SIGCHLD, [](int){});
 
     Vector<String> params;
