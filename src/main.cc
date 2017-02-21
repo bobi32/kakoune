@@ -33,11 +33,21 @@
 #include <unistd.h>
 #include <pwd.h>
 
-using namespace Kakoune;
-
-struct startup_error : Kakoune::runtime_error
+namespace Kakoune
 {
-    using Kakoune::runtime_error::runtime_error;
+
+static const char* startup_info =
+"Kakoune recent breaking changes:\n"
+" * <a-'> (rotate selection contents) is now <a-\">,\n"
+"   <a-'> is rotate selections backwards.\n"
+" * The `identifier` face has been replaced with `variable`,\n"
+"   `function` and `module`, update your custom colorschemes\n"
+" * BufNew and BufOpen hooks have been renamed to BufNewFile\n"
+"   and BufOpenFile.\n";
+
+struct startup_error : runtime_error
+{
+    using runtime_error::runtime_error;
 };
 
 inline void write_stdout(StringView str) { write(1, str); }
@@ -186,6 +196,19 @@ void register_registers()
                 for (auto& sel : context.selections())
                     result.emplace_back(i < sel.captures().size() ? sel.captures()[i] : "");
                 return result;
+            },
+            [i](Context& context, ConstArrayView<String> values) {
+                if (values.empty())
+                    return;
+
+                auto& sels = context.selections();
+                for (size_t sel_index = 0; sel_index < sels.size(); ++sel_index)
+                {
+                    auto& sel = sels[sel_index];
+                    if (sel.captures().size() < i+1)
+                        sel.captures().resize(i+1);
+                    sel.captures()[i] = values[std::min(sel_index, values.size()-1)];
+                }
             }));
     }
 
@@ -285,12 +308,9 @@ void register_options()
                        ""_str);
 }
 
-struct convert_to_client_mode
-{
-    String session;
-    String buffer_name;
-    String selections;
-};
+static Client* local_client = nullptr;
+static UserInterface* local_ui = nullptr;
+static bool convert_to_client_pending = false;
 
 enum class UIType
 {
@@ -299,21 +319,13 @@ enum class UIType
     Dummy,
 };
 
-static Client* local_client = nullptr;
-static UserInterface* local_ui = nullptr;
-static bool convert_to_client_pending = false;
-
-pid_t fork_server_to_background()
+UIType parse_ui_type(StringView ui_name)
 {
-    if (pid_t pid = fork())
-        return pid;
+    if (ui_name == "ncurses") return UIType::NCurses;
+    if (ui_name == "json") return UIType::Json;
+    if (ui_name == "dummy") return UIType::Dummy;
 
-    if (fork()) // double fork to orphan the server
-        exit(0);
-
-    write_stderr(format("Kakoune forked server to background ({}), for session '{}'\n",
-                        getpid(), Server::instance().session()));
-    return 0;
+    throw parameter_error(format("error: unknown ui type: '{}'", ui_name));
 }
 
 std::unique_ptr<UserInterface> make_ui(UIType ui_type)
@@ -333,7 +345,7 @@ std::unique_ptr<UserInterface> make_ui(UIType ui_type)
         void draw_status(const DisplayLine&, const DisplayLine&, const Face&) override {}
         DisplayCoord dimensions() override { return {24,80}; }
         void refresh(bool) override {}
-        void set_on_key(OnKeyCallback callback) override {}
+        void set_on_key(OnKeyCallback) override {}
         void set_ui_options(const Options&) override {}
     };
 
@@ -344,6 +356,19 @@ std::unique_ptr<UserInterface> make_ui(UIType ui_type)
         case UIType::Dummy: return make_unique<DummyUI>();
     }
     throw logic_error{};
+}
+
+pid_t fork_server_to_background()
+{
+    if (pid_t pid = fork())
+        return pid;
+
+    if (fork()) // double fork to orphan the server
+        exit(0);
+
+    write_stderr(format("Kakoune forked server to background ({}), for session '{}'\n",
+                        getpid(), Server::instance().session()));
+    return 0;
 }
 
 std::unique_ptr<UserInterface> create_local_ui(UIType ui_type)
@@ -423,53 +448,6 @@ std::unique_ptr<UserInterface> create_local_ui(UIType ui_type)
     return make_unique<LocalUI>();
 }
 
-void sigint_handler(int signal){
-    Key key = ctrl(Key('c'));
-    Vector<std::unique_ptr<Client>, MemoryDomain::Client>::const_iterator it =
-            ClientManager::instance().begin();
-    const bool debug_keys = (bool)((*it)->context().options()["debug"].get<DebugFlags>() & DebugFlags::Keys);
-
-    /* Copied from
-     * bool Client::process_pending_inputs()
-     * in client.cc */
-    if (debug_keys)
-        write_to_debug_buffer(format("Client '{}' got key '{}'",
-                                     (*it)->context().name(), key_to_str(key)));
-    (*it)->input_handler().handle_key(key);
-    (*it)->context().hooks().run_hook("RawKey", key_to_str(key), (*it)->context());
-}
-
-void signal_handler(int signal)
-{
-    NCursesUI::abort();
-    const char* text = nullptr;
-    switch (signal)
-    {
-        case SIGSEGV: text = "SIGSEGV"; break;
-        case SIGFPE:  text = "SIGFPE";  break;
-        case SIGQUIT: text = "SIGQUIT"; break;
-        case SIGTERM: text = "SIGTERM"; break;
-        case SIGPIPE: text = "SIGPIPE"; break;
-    }
-    if (signal != SIGTERM)
-    {
-        auto msg = format("Received {}, exiting.\nPid: {}\nCallstack:\n{}",
-                          text, getpid(), Backtrace{}.desc());
-        write_stderr(msg);
-        notify_fatal_error(msg);
-    }
-
-    if (Server::has_instance())
-        Server::instance().close_session();
-    if (BufferManager::has_instance())
-        BufferManager::instance().backup_modified_buffers();
-
-    if (signal == SIGTERM)
-        exit(-1);
-    else
-        abort();
-}
-
 int run_client(StringView session, StringView init_cmds,
                Optional<BufferCoord> init_coord, UIType ui_type)
 {
@@ -489,13 +467,30 @@ int run_client(StringView session, StringView init_cmds,
     return 0;
 }
 
+struct convert_to_client_mode
+{
+    String session;
+    String buffer_name;
+    String selections;
+};
+
+enum class ServerFlags
+{
+    None        = 0,
+    IgnoreKakrc = 1 << 0,
+    Daemon      = 1 << 1,
+    ReadOnly    = 1 << 2,
+    StartupInfo = 1 << 3,
+};
+template<> struct WithBitOps<ServerFlags> : std::true_type {};
+
 int run_server(StringView session,
                StringView init_cmds, Optional<BufferCoord> init_coord,
-               bool ignore_kakrc, bool daemon, bool readonly, UIType ui_type,
+               ServerFlags flags, UIType ui_type,
                ConstArrayView<StringView> files)
 {
     static bool terminate = false;
-    if (daemon)
+    if (flags & ServerFlags::Daemon)
     {
         if (session.empty())
         {
@@ -534,18 +529,18 @@ int run_server(StringView session,
 
     write_to_debug_buffer("*** This is the debug buffer, where debug info will be written ***");
 
-    GlobalScope::instance().options().get_local_option("readonly").set(readonly);
+    GlobalScope::instance().options().get_local_option("readonly").set<bool>(flags & ServerFlags::ReadOnly);
 
     Server server{session.empty() ? to_string(getpid()) : session.str()};
 
     bool startup_error = false;
-    if (not ignore_kakrc) try
+    if (not (flags & ServerFlags::IgnoreKakrc)) try
     {
         Context initialisation_context{Context::EmptyContextFlag{}};
         command_manager.execute(format("source {}/kakrc", runtime_directory()),
                                 initialisation_context);
     }
-    catch (Kakoune::runtime_error& error)
+    catch (runtime_error& error)
     {
         startup_error = true;
         write_to_debug_buffer(format("error while parsing kakrc:\n"
@@ -566,10 +561,10 @@ int run_server(StringView session,
             try
             {
                 Buffer *buffer = open_or_create_file_buffer(file);
-                if (readonly)
+                if (flags & ServerFlags::ReadOnly)
                     buffer->flags() |= Buffer::Flags::ReadOnly;
             }
-            catch (Kakoune::runtime_error& error)
+            catch (runtime_error& error)
             {
                 startup_error = true;
                 write_to_debug_buffer(format("error while opening file '{}':\n"
@@ -577,24 +572,29 @@ int run_server(StringView session,
             }
         }
     }
-    catch (Kakoune::runtime_error& error)
+    catch (runtime_error& error)
     {
          write_to_debug_buffer(format("error while opening command line files: {}", error.what()));
     }
 
     try
     {
-        if (not daemon)
+        if (not (flags & ServerFlags::Daemon))
+        {
             local_client = client_manager.create_client(
                  create_local_ui(ui_type), get_env_vars(), init_cmds, init_coord);
 
-        if (local_client and startup_error)
-            local_client->print_status({
-                "error during startup, see *debug* buffer for details",
-                get_face("Error")
-            });
+            if (startup_error)
+                local_client->print_status({
+                    "error during startup, see *debug* buffer for details",
+                    get_face("Error")
+                });
 
-        while (not terminate and (not client_manager.empty() or daemon))
+            if (flags & ServerFlags::StartupInfo)
+                local_client->info_show("Welcome to Kakoune", startup_info, {}, InfoStyle::Prompt);
+        }
+
+        while (not terminate and (not client_manager.empty() or (flags & ServerFlags::Daemon)))
         {
             client_manager.redraw_clients();
             event_manager.handle_next_events(EventMode::Normal);
@@ -668,7 +668,7 @@ int run_filter(StringView keystr, StringView commands, ConstArrayView<StringView
                 for (auto& key : keys)
                     input_handler.handle_key(key);
             }
-            catch (Kakoune::runtime_error& err)
+            catch (runtime_error& err)
             {
                 if (not quiet)
                     write_stderr(format("error while applying keys to buffer '{}': {}\n",
@@ -693,7 +693,7 @@ int run_filter(StringView keystr, StringView commands, ConstArrayView<StringView
             buffer_manager.delete_buffer(buffer);
         }
     }
-    catch (Kakoune::runtime_error& err)
+    catch (runtime_error& err)
     {
         write_stderr(format("error: {}\n", err.what()));
     }
@@ -727,17 +727,59 @@ int run_pipe(StringView session)
     return 0;
 }
 
-UIType parse_ui_type(StringView ui_name)
-{
-    if (ui_name == "ncurses") return UIType::NCurses;
-    if (ui_name == "json") return UIType::Json;
-    if (ui_name == "dummy") return UIType::Dummy;
+void sigint_handler(int signal){
+    Key key = ctrl(Key('c'));
+    Vector<std::unique_ptr<Client>, MemoryDomain::Client>::const_iterator it =
+            ClientManager::instance().begin();
+    const bool debug_keys = (bool)((*it)->context().options()["debug"].get<DebugFlags>() & DebugFlags::Keys);
 
-    throw parameter_error(format("error: unknown ui type: '{}'", ui_name));
+    /* Copied from
+     * bool Client::process_pending_inputs()
+     * in client.cc */
+    if (debug_keys)
+        write_to_debug_buffer(format("Client '{}' got key '{}'",
+                                     (*it)->context().name(), key_to_str(key)));
+    (*it)->input_handler().handle_key(key);
+    (*it)->context().hooks().run_hook("RawKey", key_to_str(key), (*it)->context());
+}
+
+void signal_handler(int signal)
+{
+    NCursesUI::abort();
+    const char* text = nullptr;
+    switch (signal)
+    {
+        case SIGSEGV: text = "SIGSEGV"; break;
+        case SIGFPE:  text = "SIGFPE";  break;
+        case SIGQUIT: text = "SIGQUIT"; break;
+        case SIGTERM: text = "SIGTERM"; break;
+        case SIGPIPE: text = "SIGPIPE"; break;
+    }
+    if (signal != SIGTERM)
+    {
+        auto msg = format("Received {}, exiting.\nPid: {}\nCallstack:\n{}",
+                          text, getpid(), Backtrace{}.desc());
+        write_stderr(msg);
+        notify_fatal_error(msg);
+    }
+
+    if (Server::has_instance())
+        Server::instance().close_session();
+    if (BufferManager::has_instance())
+        BufferManager::instance().backup_modified_buffers();
+
+    if (signal == SIGTERM)
+        exit(-1);
+    else
+        abort();
+}
+
 }
 
 int main(int argc, char* argv[])
 {
+    using namespace Kakoune;
+
     setlocale(LC_ALL, "");
 
     set_signal_handler(SIGSEGV, signal_handler);
@@ -749,7 +791,7 @@ int main(int argc, char* argv[])
     set_signal_handler(SIGCHLD, [](int){});
 
     Vector<String> params;
-    for (size_t i = 1; i < argc; ++i)
+    for (int i = 1; i < argc; ++i)
         params.emplace_back(argv[i]);
 
     const ParameterDesc param_desc{
@@ -878,11 +920,11 @@ int main(int argc, char* argv[])
             StringView session = parser.get_switch("s").value_or(StringView{});
             try
             {
-                return run_server(session, init_cmds, init_coord,
-                                  (bool)parser.get_switch("n"),
-                                  (bool)parser.get_switch("d"),
-                                  (bool)parser.get_switch("ro"),
-                                  ui_type, files);
+                auto flags = (parser.get_switch("n") ? ServerFlags::IgnoreKakrc : ServerFlags::None) |
+                             (parser.get_switch("d") ? ServerFlags::Daemon : ServerFlags::None) |
+                             (parser.get_switch("ro") ? ServerFlags::ReadOnly : ServerFlags::None) |
+                             (argc == 1 ? ServerFlags::StartupInfo : ServerFlags::None);
+                return run_server(session, init_cmds, init_coord, flags, ui_type, files);
             }
             catch (convert_to_client_mode& convert)
             {
@@ -893,7 +935,7 @@ int main(int argc, char* argv[])
             }
         }
     }
-    catch (Kakoune::parameter_error& error)
+    catch (parameter_error& error)
     {
         write_stderr(format("Error while parsing parameters: {}\n"
                             "Valid switches:\n"

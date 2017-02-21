@@ -758,8 +758,8 @@ const CommandDesc remove_highlighter_cmd = {
 };
 
 static constexpr auto hooks = {
-    "BufCreate", "BufNew", "BufOpen", "BufClose", "BufWritePost", "BufWritePre",
-    "BufOpenFifo", "BufCloseFifo", "BufReadFifo", "BufSetOption",
+    "BufCreate", "BufNewFile", "BufOpenFile", "BufClose", "BufWritePost",
+    "BufWritePre", "BufOpenFifo", "BufCloseFifo", "BufReadFifo", "BufSetOption",
     "InsertBegin", "InsertChar", "InsertEnd", "InsertIdle", "InsertKey",
     "InsertMove", "InsertCompletionHide", "InsertCompletionShow",
     "KakBegin", "KakEnd", "FocusIn", "FocusOut", "RuntimeError",
@@ -1487,41 +1487,46 @@ private:
 class RegisterRestorer
 {
 public:
-    RegisterRestorer(char name, const Context& context)
-      : m_name(name)
+    RegisterRestorer(char name, Context& context)
+      : m_context{context}, m_name{name}
     {
-        ConstArrayView<String> save = RegisterManager::instance()[name].values(context);
+        ConstArrayView<String> save = RegisterManager::instance()[name].get(context);
         m_save = Vector<String>(save.begin(), save.end());
     }
 
     RegisterRestorer(RegisterRestorer&& other) noexcept
-        : m_save(std::move(other.m_save)), m_name(other.m_name)
+        : m_context{other.m_context}, m_save{std::move(other.m_save)}, m_name{other.m_name}
     {
         other.m_name = 0;
-    }
-
-    RegisterRestorer& operator=(RegisterRestorer&& other) noexcept
-    {
-        m_save = std::move(other.m_save);
-        m_name = other.m_name;
-        other.m_name = 0;
-        return *this;
     }
 
     ~RegisterRestorer()
     {
-        if (m_name != 0)
-            RegisterManager::instance()[m_name] = m_save;
+        if (m_name != 0) try
+        {
+            RegisterManager::instance()[m_name].set(m_context, m_save);
+        }
+        catch (runtime_error& e)
+        {
+            write_to_debug_buffer(format("Could not restore register '{}': {}",
+                                         m_name, e.what()));
+        }
     }
 
 private:
     Vector<String> m_save;
+    Context&       m_context;
     char           m_name;
 };
 
 template<typename Func>
 void context_wrap(const ParametersParser& parser, Context& context, Func func)
 {
+    if ((int)(bool)parser.get_switch("buffer") +
+        (int)(bool)parser.get_switch("client") +
+        (int)(bool)parser.get_switch("try-client") > 1)
+        throw runtime_error{"Only one of -buffer, -client or -try-client can be specified"};
+
     // Disable these options to avoid costly code paths (and potential screen
     // redraws) That are useful only in interactive contexts.
     DisableOption<AutoInfo> disable_autoinfo(context, "autoinfo");
@@ -2005,7 +2010,7 @@ const CommandDesc set_register_cmd = {
     CommandCompleter{},
     [](const ParametersParser& parser, Context& context, const ShellContext&)
     {
-        RegisterManager::instance()[parser[0]] = ConstArrayView<String>(parser[1]);
+        RegisterManager::instance()[parser[0]].set(context, {parser[1]});
     }
 };
 
